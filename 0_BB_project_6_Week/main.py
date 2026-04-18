@@ -83,7 +83,8 @@ def main():
     tasks = [
         ("data_loader.py", 0),  # ждём 10 секунд после загрузки
         ("signals_processor.py", 0),  # ждём 5 секунд после signals_processor
-        ("telegram_notifier.py", 0)  # выполняем без задержки
+        ("telegram_notifier.py", 0),  # выполняем без задержки
+        ("email_notifier.py", 0)  # отправляем email-отчёт (ДОБАВЛЕНО)
     ]
 
 #=== Изменение от 090725 ============================

@@ -21,25 +21,32 @@ from email_notifier import send_email_notification  # <--- ДОБАВИТЬ ЭТ
 N = 5  # Количество недель истории (влево) для проверки наличия сигнала ВНИМАНИЕ
 
 # Задержка в отправке сообщений
-def send_with_delay(message):
-    # 2. Отправка в Telegram
+def send_with_delay(message, is_summary=False):
+    """
+    Отправляет сообщение в Telegram и Email.
+    
+    Args:
+        message: текст сообщения
+        is_summary: если True, это итоговое сообщение (отправляем только summary)
+    """
+    # 1. Отправка в Telegram
     try:
         send_telegram_message(message)
         time.sleep(3)  # Задержка 3 секунды между сообщениями
     except Exception as e:
-        print(f" Ошибка при отправке сообщения: {e}")
+        print(f" Ошибка при отправке сообщения в Telegram: {e}")
         time.sleep(5)  # Увеличиваем задержку при ошибке
         
-    # 2. Отправка на Email
+    # 2. Отправка на Email (только для индивидуальных сигналов, не для summary)
     try:
-        if EMAIL_CONFIG['enabled']:
-            # Очищаем сообщение от звездочек (*) для красивого вида в письме, если нужно
+        if EMAIL_CONFIG['enabled'] and not is_summary:
+            # Очищаем сообщение от звездочек (*) для красивого вида в письме
             clean_message = message.replace('*', '')
-            send_email_notification("Новый сигнал", clean_message)
+            send_email_notification(clean_message)  # Исправлено: передаём только текст сообщения
             time.sleep(2)  # Пауза между сервисами
     except Exception as e:
         print(f" Ошибка Email: {e}")
-        time.sleep(5) # Общая задержка цикла    
+        time.sleep(5) # Общая задержка цикла
 
 # Добавлено 17.07.25 Сообщение о начала анализа сигналов
 msg = "* ПЕСОЧНИЦА Начинаем анализ сигналов*"
@@ -229,6 +236,22 @@ def update_position(ticker, price):
             conn.commit()
 
 
+def has_active_dokupi_signal(ticker, date):
+    """
+    Проверяет, есть ли уже активный сигнал "ДОКУПИ" для указанной даты и тикера.
+    Это предотвращает дублирование сигналов при повторных запусках.
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1 FROM signals_log
+                WHERE ticker = %s AND signal_type = 'ДОКУПИ'
+                  AND signal_date = %s AND is_active = TRUE
+                LIMIT 1
+            """, (ticker, date))
+            return cur.fetchone() is not None
+
+
 def check_signals():
     """Основной метод проверки сигналов"""
     create_signals_log_table()
@@ -333,14 +356,17 @@ def check_signals():
 # === Изменено 19.06.25 ===
         if avg_price is not None and in_market and latest['close'] < avg_price:
 # === КОНЕЦ Изменено 19.06.25 ===
-            
-            msg = f" * ПЕСОЧНИЦА [~] ДОКУПИ* ({ticker})\nДата: {latest['date'].date()}\nЦель: {latest['open']:.2f} (по open завтра)"
-            send_with_delay(msg)
-            print(msg)
-            signals_found = True
-            signal_summary["ДОКУПИ"].append(ticker)  # 17.07.25 - Добавляем тикер в итоговый список
-            update_position(ticker, latest['open'])
-            log_signal(ticker, "ДОКУПИ", latest['date'].date())
+            # Проверяем, не было ли уже сигнала "ДОКУПИ" на эту дату (защита от дубликатов)
+            if has_active_dokupi_signal(ticker, latest['date'].date()):
+                pass  # Сигнал уже есть, пропускаем
+            else:
+                msg = f" * ПЕСОЧНИЦА [~] ДОКУПИ* ({ticker})\nДата: {latest['date'].date()}\nЦель: {latest['open']:.2f} (по open завтра)"
+                send_with_delay(msg)
+                print(msg)
+                signals_found = True
+                signal_summary["ДОКУПИ"].append(ticker)  # 17.07.25 - Добавляем тикер в итоговый список
+                update_position(ticker, latest['open'])
+                log_signal(ticker, "ДОКУПИ", latest['date'].date())
 
         # === Сигнал 4: ПРОДАЙ ===
         with connect() as conn:
