@@ -108,23 +108,61 @@ def find_earliest_available_date(client, figi, ticker):
     return last_successful_date
 
 
-def get_candles(client, figi, from_date, ticker):
+def get_last_candle_date_from_db(conn, ticker):
+    """
+    Получает дату последней свечи из БД для тикера.
+    Возвращает datetime или None, если таблица пуста/не существует.
+    """
+    table_name = f"quotes_{ticker.lower()}"
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(sql.SQL("SELECT MAX(date) FROM {}").format(sql.Identifier(table_name)))
+            result = cursor.fetchone()[0]
+            if result:
+                print(f"Для тикера {ticker} последняя дата в БД: {result}")
+                return result
+            else:
+                print(f"Таблица {table_name} пуста")
+                return None
+    except Exception as e:
+        print(f"Таблица {table_name} не существует или ошибка: {e}")
+        return None
+
+
+def get_candles(client, figi, from_date, ticker, conn=None):
     """
     Загружает исторические данные по свечам за указанный период.
+    
+    OPTIMIZATION: Если передано соединение с БД (conn), проверяет последнюю дату
+    и загружает только недостающие данные.
 
     Args:
         client: клиент Tinkoff Invest API
         figi: идентификатор инструмента
         from_date: начальная дата
         ticker: тикер акции
+        conn: соединение с БД (опционально, для оптимизации)
 
     Returns:
         candles: список свечей
     """
     all_candles = []
-    current_date = from_date
+    
+    # === OPTIMIZATION: Проверяем последнюю дату в БД ===
+    if conn:
+        last_db_date = get_last_candle_date_from_db(conn, ticker)
+        if last_db_date:
+            # Загружаем только данные ПОСЛЕ последней даты в БД
+            current_date = last_db_date + timedelta(days=1)
+            print(f"OPTIMIZATION: Загружаем данные для {ticker} с {current_date} (после последней записи в БД)")
+        else:
+            current_date = from_date
+            print(f"БД пуста/не существует, загружаем все данные с {from_date}")
+    else:
+        current_date = from_date
+    
     end_date = now()
-    chunk_size = timedelta(days=365)
+    chunk_size = timedelta(days=730)  # Увеличено с 365 до 730 дней для уменьшения количества запросов
 
     while current_date < end_date:
         try:
@@ -323,8 +361,8 @@ def main():
                     # Создаем таблицу в БД
                     create_table(conn, ticker)
 
-                    # Получаем все свечи
-                    candles = get_candles(client, figi, earliest_date, ticker)
+                    # Получаем все свечи (с оптимизацией: передаём conn для проверки последней даты)
+                    candles = get_candles(client, figi, earliest_date, ticker, conn)
 
                     # Сохраняем в БД
                     save_to_db(conn, ticker, candles)
