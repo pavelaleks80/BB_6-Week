@@ -67,8 +67,9 @@ API_LIMITS = {
     'delay_between_requests': 1   # Задержка (секунды) между запросами
 }
 
-STARTING_DEPOSIT = 300_000  # Начальный депозит
-MAX_OPERATION_AMOUNT = 5000  # Максимум денег на одну операцию
+STARTING_CAPITAL = 1_000_000
+STARTING_DEPOSIT = 50_000  # Начальный депозит
+MAX_OPERATION_AMOUNT = 5_000  # Максимум денег на одну операцию
 
 # Комиссия за вход 0,3% и за выход 0,3%
 #COMMISSION = 0.003  # 0.3% комиссии за операцию
@@ -83,7 +84,7 @@ MAX_SHARES_PER_TRADE = 10
 EMAIL_CONFIG = {
     'enabled': True,  # Включить отправку на email
     'smtp_server': 'smtp.mail.ru',
-    'smtp_port': 465,  # SSL порт для Mail.ru
+    'smtp_port': 465, #587,  # SSL порт для Mail.ru / или порт 587
     'sender_email': os.getenv('EMAIL_LOGIN', 'bbweek@mail.ru'),
     'receiver_email': os.getenv('EMAIL_RECEIVER', 'bbweek@mail.ru'),
     'password': os.getenv('EMAIL_PASSWORD')  # Пароль приложения
