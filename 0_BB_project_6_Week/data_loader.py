@@ -9,381 +9,455 @@ data_loader.py
 - PostgreSQL
 """
 import sys
-import time
 import os
+from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 import pandas as pd
 import numpy as np
-from tqdm import tqdm
-from datetime import datetime, timedelta
-import psycopg2
-from psycopg2 import sql
-from tinkoff.invest import Client, CandleInterval
-from tinkoff.invest.utils import now
-from tinkoff.invest.exceptions import RequestError
-from psycopg2.extras import execute_batch
-from config import DB_CONFIG, TOKEN, TICKERS
+from sqlalchemy import create_engine, text
+import warnings
 
-def connect():
-    """Подключение к базе данных PostgreSQL"""
-    return psycopg2.connect(**DB_CONFIG)
+# Игнорируем предупреждения Pandas о цепочках присваиваний
+warnings.filterwarnings(action='ignore', category=pd.errors.SettingWithCopyWarning)
 
-def get_figi_for_ticker(client, ticker):
-    
-    """
-Получает FIGI и дату первой свечи для заданного тикера.
+# Добавляем родительскую директорию в путь, чтобы импортировать config
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
 
-Args:
-    client: клиент Tinkoff Invest API
-    ticker: тикер акции
+try:
+    import config
+except ImportError:
+    print("❌ Ошибка: Не удалось импортировать config.py. Убедитесь, что файл находится в родительской папке.")
+    sys.exit(1)
 
-Returns:
-    figi: уникальный идентификатор инструмента
-    first_candle_date: дата первой доступной свечи
-"""
+# === КОНФИГУРАЦИЯ БЭКТЕСТА ===
+# Начальный капитал
+STARTING_CAPITAL = config.STARTING_DEPOSIT
+# Комиссия (берем из конфига, если там Decimal, иначе конвертируем)
+COMMISSION_RATE = float(config.COMMISSION) if hasattr(config, 'COMMISSION') else 0.003
+# Максимум денег на одну сделку
+MAX_OPERATION_AMOUNT = config.MAX_OPERATION_AMOUNT
+# Максимум акций в штуках на одну сделку (если есть в конфиге, иначе 0 - без лимита)
+MAX_SHARES_PER_TRADE = getattr(config, 'MAX_SHARES_PER_TRADE', 0)
+
+# Параметры Bollinger Bands
+BB_WINDOW = config.BOLLINGER_CONFIG['window']
+BB_NUM_STD = config.BOLLINGER_CONFIG['num_std']
+
+# Список тикеров для тестирования (берем из config)
+TICKERS = config.TICKERS
+
+# Подключение к БД
+try:
+    engine = create_engine(config.DATABASE_URI)
+except Exception as e:
+    print(f"❌ Ошибка подключения к БД: {e}")
+    sys.exit(1)
+
+def get_weekday(date_val):
+    """Возвращает день недели (0=Пн, 6=Вс)"""
+    if isinstance(date_val, pd.Timestamp):
+        return date_val.weekday()
+    return date_val.weekday()
+
+def find_first_monday(start_date_str):
+    """Находит первый понедельник в БД, равный или больший start_date_str"""
     try:
-        instruments = client.instruments.shares().instruments
-        for instrument in instruments:
-            if instrument.ticker == ticker:
-                print(f"Для тикера {ticker} найдена дата первой свечи: {instrument.first_1day_candle_date}")
-                return instrument.figi, instrument.first_1day_candle_date
-        print(f"Для тикера {ticker} не найдена информация о первой свече")
-        return None, None
-    except RequestError as e:
-        print(f"Ошибка при получении FIGI для {ticker}: {e}")
-        return None, None
-
-
-def find_earliest_available_date(client, figi, ticker):
-    """
-    Ищет самую раннюю доступную дату для получения данных по тикеру.
-
-    Args:
-        client: клиент Tinkoff Invest API
-        figi: идентификатор инструмента
-        ticker: тикер акции
-
-    Returns:
-        date: самая ранняя доступная дата
-    """
-    end_date = now()
-    start_date = datetime(1900, 1, 1)
-    print(f"Поиск самой ранней доступной даты для FIGI {figi} (тикер: {ticker})")
-
-    try:
-        candles = client.market_data.get_candles(
-            figi=figi,
-            from_=start_date,
-            to=start_date + timedelta(days=7),
-            interval=CandleInterval.CANDLE_INTERVAL_WEEK
-        )
-        if candles.candles:
-            print(f"Найдены данные с самой ранней даты {start_date}")
-            return start_date
-    except RequestError:
-        pass
-
-    last_successful_date = None
-    while start_date < end_date:
-        mid_date = start_date + (end_date - start_date) // 2
-        try:
-            candles = client.market_data.get_candles(
-                figi=figi,
-                from_=mid_date,
-                to=mid_date + timedelta(days=7),
-                interval=CandleInterval.CANDLE_INTERVAL_WEEK
-            )
-            if candles.candles:
-                print(f"Найдены данные для даты {mid_date}")
-                last_successful_date = mid_date
-                end_date = mid_date - timedelta(days=7)
-            else:
-                start_date = mid_date + timedelta(days=7)
-        except RequestError:
-            start_date = mid_date + timedelta(days=7)
-
-    if last_successful_date:
-        print(f"Самая ранняя доступная дата: {last_successful_date}")
-    else:
-        print("Не удалось найти доступные данные")
-    return last_successful_date
-
-
-def get_last_candle_date_from_db(conn, ticker):
-    """
-    Получает дату последней свечи из БД для тикера.
-    Возвращает datetime или None, если таблица пуста/не существует.
-    """
-    table_name = f"quotes_{ticker.lower()}"
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(sql.SQL("SELECT MAX(date) FROM {}").format(sql.Identifier(table_name)))
-            result = cursor.fetchone()[0]
-            if result:
-                print(f"Для тикера {ticker} последняя дата в БД: {result}")
-                return result
-            else:
-                print(f"Таблица {table_name} пуста")
-                return None
-    except Exception as e:
-        print(f"Таблица {table_name} не существует или ошибка: {e}")
+        start_dt = pd.to_datetime(start_date_str)
+    except:
+        print("❌ Неверный формат даты. Используйте ГГГГ-ММ-ДД")
         return None
 
-
-def get_candles(client, figi, from_date, ticker, conn=None):
-    """
-    Загружает исторические данные по свечам за указанный период.
+    # Проверяем тикеры по очереди, чтобы найти самую раннюю доступную дату >= start_dt
+    # Нам нужно найти первый ПОНЕДЕЛЬНИК, для которого есть данные
+    min_available_date = None
     
-    OPTIMIZATION: Если передано соединение с БД (conn), проверяет последнюю дату
-    и загружает только недостающие данные.
-
-    Args:
-        client: клиент Tinkoff Invest API
-        figi: идентификатор инструмента
-        from_date: начальная дата
-        ticker: тикер акции
-        conn: соединение с БД (опционально, для оптимизации)
-
-    Returns:
-        candles: список свечей
-    """
-    all_candles = []
+    # Берем первые 5 тикеров для проверки наличия данных (чтобы не перебирать все 80)
+    check_tickers = TICKERS[:5] if len(TICKERS) > 5 else TICKERS
     
-    # === OPTIMIZATION: Проверяем последнюю дату в БД ===
-    if conn:
-        last_db_date = get_last_candle_date_from_db(conn, ticker)
-        if last_db_date:
-            # Загружаем только данные ПОСЛЕ последней даты в БД
-            current_date = last_db_date + timedelta(days=1)
-            print(f"OPTIMIZATION: Загружаем данные для {ticker} с {current_date} (после последней записи в БД)")
-        else:
-            current_date = from_date
-            print(f"БД пуста/не существует, загружаем все данные с {from_date}")
+    with engine.connect() as conn:
+        for ticker in check_tickers:
+            table_name = f"quotes_{ticker.lower()}"
+            # Проверяем существование таблицы
+            insp = text(f"""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = '{table_name}' AND column_name = 'date'
+            """)
+            # Упрощенная проверка: просто пытаемся выбрать минимальную дату
+            try:
+                query = text(f"""
+                    SELECT MIN(date) as min_d 
+                    FROM {table_name} 
+                    WHERE date >= :start_date
+                """)
+                result = conn.execute(query, {"start_date": start_dt}).fetchone()
+                if result and result[0]:
+                    found_date = result[0]
+                    if isinstance(found_date, datetime):
+                        found_date = pd.Timestamp(found_date)
+                    
+                    if min_available_date is None or found_date < min_available_date:
+                        min_available_date = found_date
+            except Exception:
+                continue
+
+    if min_available_date is None:
+        print(f"⚠️ Данные в БД не найдены начиная с {start_date_str}")
+        return None
+
+    # Корректируем до понедельника
+    # Если найденная дата - не понедельник, ищем следующий понедельник
+    # Но так как данные недельные, скорее всего дата уже будет понедельником (или днем, когда были торги)
+    # Стратегия требует входа в понедельник. Если данные приходят в другой день, берем следующий ПН.
+    
+    weekday = min_available_date.weekday()
+    if weekday == 0: # Понедельник
+        return min_available_date
     else:
-        current_date = from_date
+        # Следующий понедельник
+        next_monday = min_available_date + timedelta(days=(7 - weekday))
+        print(f"ℹ️ Дата {min_available_date.date()} не является понедельником. Сдвиг старта на {next_monday.date()}")
+        return next_monday
+
+def load_data(ticker, start_date):
+    """Загружает данные для тикера с указанной даты"""
+    table_name = f"quotes_{ticker.lower()}"
     
-    end_date = now()
-    chunk_size = timedelta(days=730)  # Увеличено с 365 до 730 дней для уменьшения количества запросов
+    query = text(f"""
+        SELECT date, open, high, low, close, volume
+        FROM {table_name}
+        WHERE date >= :start_date
+        ORDER BY date ASC
+    """)
+    
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn, params={"start_date": start_date})
+            
+        if df.empty:
+            return None
+            
+        # Преобразуем дату
+        df['date'] = pd.to_datetime(df['date'])
+        df.set_index('date', inplace=True)
+        
+        # Приводим типы данных к числовым
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+        return df
+        
+    except Exception as e:
+        print(f"❌ Ошибка чтения данных для {ticker}: {e}")
+        return None
 
-    while current_date < end_date:
-        try:
-            next_date = min(current_date + chunk_size, end_date)
-            candles = client.market_data.get_candles(
-                figi=figi,
-                from_=current_date,
-                to=next_date,
-                interval=CandleInterval.CANDLE_INTERVAL_WEEK
-            )
-            if candles.candles:
-                all_candles.extend(candles.candles)
-            current_date = next_date
-        except RequestError as e:
-            print(f"Ошибка при получении свечей: {e}")
-            break
-
-    print(f"Всего загружено {len(all_candles)} записей для {ticker}")
-    return all_candles
-
-
-def calculate_bollinger_bands(df, window=20, num_std=2):
-    """
-    Рассчитывает значения Полос Боллинджера.
-
-    Args:
-        df: DataFrame с данными по ценам
-        window: окно скользящего среднего (в неделях)
-        num_std: количество стандартных отклонений
-
-    Returns:
-        df: DataFrame с добавленными колонками sma, upper_band, lower_band
-    """
-    df['sma'] = df['close'].rolling(window=window).mean()
-    df['std'] = df['close'].rolling(window=window).std()
-    df['upper_band'] = df['sma'] + (num_std * df['std'])
-    df['lower_band'] = df['sma'] - (num_std * df['std'])
+def calculate_indicators(df):
+    """Рассчитывает Bollinger Bands"""
+    if df is None or len(df) < BB_WINDOW:
+        return None
+        
+    df = df.copy()
+    
+    # SMA
+    df['sma'] = df['close'].rolling(window=BB_WINDOW).mean()
+    
+    # Std Dev
+    df['std'] = df['close'].rolling(window=BB_WINDOW).std()
+    
+    # Bands
+    df['upper'] = df['sma'] + (BB_NUM_STD * df['std'])
+    df['lower'] = df['sma'] - (BB_NUM_STD * df['std'])
+    
     return df
 
-
-def create_table(conn, ticker):
+def run_backtest(ticker, df):
     """
-    Создаёт таблицу в PostgreSQL для хранения данных по конкретному тикеру.
-
-    Args:
-        conn: соединение с базой данных
-        ticker: тикер акции
+    Эмулирует торговлю по стратегии.
+    Логика:
+    1. Покупка (Вход): Цена закрытия <= Нижней полосы (Lower Band).
+    2. Продажа (Выход): Цена закрытия >= Средней линии (SMA).
     """
-    table_name = f"quotes_{ticker.lower()}"
-    print(f"Создание таблицы {table_name} для тикера {ticker}")
-
-    query = sql.SQL("""
-        CREATE TABLE IF NOT EXISTS {} (
-            date TIMESTAMP PRIMARY KEY,
-            open NUMERIC,
-            high NUMERIC,
-            low NUMERIC,
-            close NUMERIC,
-            volume BIGINT,
-            sma NUMERIC,
-            upper_band NUMERIC,
-            lower_band NUMERIC
-        )
-    """).format(sql.Identifier(table_name))
-
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(query)
-        conn.commit()
-        print(f"Таблица {table_name} успешно создана")
-    except Exception as e:
-        print(f"Ошибка при создании таблицы: {e}")
-
-
-def save_to_db(conn, ticker, candles):
-    """
-    Сохраняет данные о свечах в PostgreSQL после расчёта индикаторов,
-    предварительно проверяя, какие даты уже существуют.
-    """
-    if not candles:
-        print(f"Нет данных для сохранения для тикера {ticker}")
-        return
-
-    table_name = f"quotes_{ticker.lower()}"
+    capital = STARTING_CAPITAL
+    position = 0 # Количество акций
+    avg_buy_price = 0.0
     
-    # Получаем список дат, уже существующих в БД
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(sql.SQL("SELECT date FROM {}").format(sql.Identifier(table_name)))
-            existing_dates = set(row[0] for row in cursor.fetchall())
-    except Exception as e:
-        print(f"Ошибка при чтении существующих дат: {e}")
-        existing_dates = set()
-
-    # Преобразование в DataFrame
-    data = []
-    for candle in candles:
-        if candle.time in existing_dates:
-            continue  # Пропускаем, если такая дата уже есть
-        data.append({
-            'date': candle.time,
-            'open': float(candle.open.units + candle.open.nano / 1e9),
-            'high': float(candle.high.units + candle.high.nano / 1e9),  # Исправлено: было candle.open.nano
-            'low': float(candle.low.units + candle.low.nano / 1e9),
-            'close': float(candle.close.units + candle.close.nano / 1e9),
-            'volume': int(candle.volume)
-        })
-
-    if not data:
-        print(f"Нет новых данных для тикера {ticker}, все записи уже в БД")
-        return
-
-    df = pd.DataFrame(data)
-    df = calculate_bollinger_bands(df)
-    if 'std' in df.columns:
-        df.drop(columns=['std'], inplace=True)
-    df.dropna(inplace=True)
-
-    # Подготовка данных для вставки
-    records = df.to_records(index=False)
-    data_to_insert = [
-        tuple(
-            None if pd.isna(x) else (
-                int(x) if isinstance(x, np.integer) else
-                float(x) if isinstance(x, np.floating) else x
-            )
-            for x in row
-        )
-        for row in records
-    ]
-
-    print(f"Сохранение {len(data_to_insert)} новых записей в таблицу {table_name}")
-    try:
-        with conn.cursor() as cursor:
-            insert_query = sql.SQL("""
-                INSERT INTO {}
-                (date, open, high, low, close, volume, sma, upper_band, lower_band)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (date) DO NOTHING
-            """).format(sql.Identifier(table_name))
-            execute_batch(cursor, insert_query, data_to_insert, page_size=500)
-        conn.commit()
-        print(f"Новые данные для {ticker} успешно сохранены")
-    except Exception as e:
-        print(f"Ошибка при сохранении данных: {e}")
+    trades = [] # Список сделок: {'date': ..., 'type': 'BUY/SELL', 'price': ..., 'qty': ..., 'profit': ...}
+    
+    # Проходим по строкам, начиная с той, где есть индикаторы (после BB_WINDOW)
+    # Используем iterrows для простоты эмуляции последовательных решений
+    for i in range(BB_WINDOW, len(df)):
+        row = df.iloc[i]
+        prev_row = df.iloc[i-1]
+        
+        current_date = row.name
+        close_price = float(row['close'])
+        lower_band = float(row['lower'])
+        sma = float(row['sma'])
+        
+        # --- ЛОГИКА ПОКУПКИ ---
+        # Если нет позиции и цена пробила нижнюю границу вниз (закрылась ниже)
+        if position == 0:
+            if close_price <= lower_band:
+                # Рассчитываем количество акций
+                # На сумму MAX_OPERATION_AMOUNT или весь капитал, если он меньше
+                amount_to_spend = min(capital, MAX_OPERATION_AMOUNT)
+                
+                if amount_to_spend < close_price:
+                    continue # Не хватает даже на 1 акцию
+                
+                qty = int(amount_to_spend / close_price)
+                
+                if MAX_SHARES_PER_TRADE > 0:
+                    qty = min(qty, MAX_SHARES_PER_TRADE)
+                
+                if qty > 0:
+                    cost = qty * close_price
+                    commission = cost * COMMISSION_RATE
+                    
+                    if capital >= (cost + commission):
+                        capital -= (cost + commission)
+                        position = qty
+                        avg_buy_price = close_price
+                        
+                        trades.append({
+                            'ticker': ticker,
+                            'date': current_date,
+                            'type': 'BUY',
+                            'price': close_price,
+                            'qty': qty,
+                            'commission': commission,
+                            'profit': 0.0,
+                            'capital_after': capital
+                        })
+        
+        # --- ЛОГИКА ПРОДАЖИ ---
+        # Если есть позиция и цена выросла до SMA или выше
+        elif position > 0:
+            if close_price >= sma:
+                sell_cost = position * close_price
+                commission = sell_cost * COMMISSION_RATE
+                
+                profit = (sell_cost - (position * avg_buy_price)) - commission
+                
+                capital += (sell_cost - commission)
+                
+                trades.append({
+                    'ticker': ticker,
+                    'date': current_date,
+                    'type': 'SELL',
+                    'price': close_price,
+                    'qty': position,
+                    'commission': commission,
+                    'profit': profit,
+                    'capital_after': capital
+                })
+                
+                # Сброс позиции
+                position = 0
+                avg_buy_price = 0.0
+    
+    # Финальный расчет, если позиция осталась открытой (считаем по последней цене)
+    final_capital = capital
+    if position > 0:
+        last_price = float(df.iloc[-1]['close'])
+        unrealized_profit = (position * last_price) - (position * avg_buy_price)
+        # В итоговый капитал добавляем стоимость позиции по текущей цене (без комиссии, т.к. не продали)
+        final_capital = capital + (position * last_price)
+        # Можно добавить запись о незакрытой позиции, но в отчете по сделкам её не будет как SELL
+        
+    return trades, final_capital, position
 
 def main():
-    """
-    Основная функция запуска процесса загрузки данных.
-    """    
-    start_time = time.time()
+    print("="*40)
+    print("🚀 ЗАПУСК БЭКТЕСТА СТРАТЕГИИ BB_6-Week")
+    print("="*40)
     
-    # Проверка токена
-    if not TOKEN or TOKEN == 'TOKEN':
-        print("ОШИБКА: Необходимо указать токен API Тинькофф Инвестиций!")
+    # Определение даты старта
+    start_date_input = input("\nВведите дату начала тестирования (ГГГГ-ММ-ДД) или нажмите Enter для даты по умолчанию (2020-01-01): ")
+    if not start_date_input.strip():
+        start_date_input = "2020-01-01"
+    
+    # Корректировка до первого понедельника с данными
+    effective_start_date = find_first_monday(start_date_input)
+    if not effective_start_date:
+        print("❌ Невозможно определить дату старта. Завершение.")
         return
 
-    # Подключение к PostgreSQL
-    try:
-        print("Подключение к PostgreSQL...")
-        conn = psycopg2.connect(**DB_CONFIG)
-        print("Успешное подключение к PostgreSQL")
-    except Exception as e:
-        print(f"Ошибка подключения к PostgreSQL: {e}")
+    print(f"📅 Старт торговли: {effective_start_date.strftime('%Y-%m-%d')}")
+    print(f"💰 Стартовый капитал на акцию: {STARTING_CAPITAL} RUB")
+    print(f"📉 Комиссия: {COMMISSION_RATE*100}%")
+    print("-" * 40)
+    
+    all_trades = []
+    stats_by_ticker = {}
+    
+    total_start_capital = 0
+    total_final_capital = 0
+    
+    # Счетчик тикеров для прогресса
+    processed_count = 0
+    
+    for ticker in TICKERS:
+        # Загрузка данных
+        df = load_data(ticker, effective_start_date)
+        
+        if df is None or len(df) < BB_WINDOW + 5:
+            # print(f"⚠️ {ticker}: Недостаточно данных для расчета индикаторов. Пропуск.")
+            continue
+        
+        # Расчет индикаторов
+        df_with_ind = calculate_indicators(df)
+        if df_with_ind is None:
+            continue
+            
+        # Запуск бэктеста
+        trades, final_cap, remaining_pos = run_backtest(ticker, df_with_ind)
+        
+        if trades:
+            all_trades.extend(trades)
+            
+            # Считаем стартовый капитал, выделенный на этот тикер
+            # Он равен количеству покупок * MAX_OPERATION_AMOUNT (упрощенно)
+            # Но точнее: сумма всех затрат на покупку (первая покупка в серии)
+            # Для простоты статистики: считаем, что на каждый тикер выделялся STARTING_CAPITAL
+            # Итоговый капитал = final_cap + (остаток позиций * цену) - это уже учтено в run_backtest
+            
+            buy_count = sum(1 for t in trades if t['type'] == 'BUY')
+            # Реальный инвестированный объем сложно оценить постфактум без учета оборота.
+            # Примем за базу: Каждый цикл покупки начинался с availability of funds.
+            # Для общей доходности портфеля предположим, что мы торговали параллельно на каждый тикер
+            # с начальным капиталом STARTING_CAPITAL.
+            
+            stats_by_ticker[ticker] = {
+                'trades_count': len(trades),
+                'buy_trades': buy_count,
+                'sell_trades': sum(1 for t in trades if t['type'] == 'SELL'),
+                'total_profit': sum(t['profit'] for t in trades),
+                'final_capital': final_cap,
+                'has_open_position': remaining_pos > 0
+            }
+            
+            total_start_capital += STARTING_CAPITAL
+            total_final_capital += final_cap
+            processed_count += 1
+        else:
+            # Если сделок не было, но данные есть
+            stats_by_ticker[ticker] = {
+                'trades_count': 0,
+                'buy_trades': 0,
+                'sell_trades': 0,
+                'total_profit': 0.0,
+                'final_capital': STARTING_CAPITAL, # Капитал не изменился
+                'has_open_position': False
+            }
+            total_start_capital += STARTING_CAPITAL
+            total_final_capital += STARTING_CAPITAL
+            processed_count += 1
+
+    if not all_trades:
+        print("\n⚠️ Бэктест завершен, но сделок не найдено.")
+        print("Проверьте дату старта и наличие данных в БД.")
         return
 
-    # Подключение к API Тинькофф
+    # === ФОРМИРОВАНИЕ ОТЧЕТА ===
+    print("\n✅ Бэктест завершен!")
+    print(f"Обработано тикеров: {processed_count}")
+    print(f"Всего сделок: {len(all_trades)}")
+    
+    # Общая статистика
+    total_profit = total_final_capital - total_start_capital
+    total_return_pct = (total_profit / total_start_capital) * 100 if total_start_capital > 0 else 0
+    
+    print("\n" + "="*40)
+    print("📊 ОБЩАЯ СТАТИСТИКА ПО СТРАТЕГИИ")
+    print("="*40)
+    print(f"Стартовый капитал (суммарный): {total_start_capital:,.2f} RUB")
+    print(f"Финальный капитал:            {total_final_capital:,.2f} RUB")
+    print(f"Общая прибыль:                 {total_profit:,.2f} RUB")
+    print(f"Общая доходность:              {total_return_pct:.2f}%")
+    print(f"Количество сделок:             {len(all_trades)}")
+    
+    # Win Rate
+    profitable_trades = sum(1 for t in all_trades if t['type'] == 'SELL' and t['profit'] > 0)
+    total_sell_trades = sum(1 for t in all_trades if t['type'] == 'SELL')
+    win_rate = (profitable_trades / total_sell_trades * 100) if total_sell_trades > 0 else 0
+    print(f"Win Rate (по закрытым сделкам): {win_rate:.2f}%")
+    
+    # Таблица по акциям
+    print("\n📈 СТАТИСТИКА ПО АКЦИЯМ:")
+    report_data = []
+    for t, stats in stats_by_ticker.items():
+        if stats['trades_count'] > 0:
+            ret_pct = ((stats['final_capital'] - STARTING_CAPITAL) / STARTING_CAPITAL) * 100
+            report_data.append({
+                'Тикер': t,
+                'Сделок': stats['trades_count'],
+                'Прибыль (RUB)': stats['total_profit'],
+                'Доходность (%)': ret_pct,
+                'Открыта поз.': 'Да' if stats['has_open_position'] else 'Нет'
+            })
+    
+    df_report = pd.DataFrame(report_data)
+    if not df_report.empty:
+        # Сортировка по прибыли
+        df_report = df_report.sort_values(by='Прибыль (RUB)', ascending=False)
+        print(df_report.to_string(index=False))
+    else:
+        print("Нет данных для отображения по акциям.")
+
+    # Сохранение в Excel
+    output_filename = f"backtest_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    
     try:
-        print("Подключение к API Тинькофф Инвестиций...")
-        with Client(TOKEN) as client:
-            print("Успешное подключение к API Тинькофф")
-            for ticker in tqdm(TICKERS, desc="Обработка тикеров"):
-                try:
-                    print(f"\nНачинаем обработку тикера {ticker}")
-
-                    # Получаем FIGI и дату первой свечи для тикера
-                    figi, first_candle_date = get_figi_for_ticker(client, ticker)
-                    if not figi:
-                        tqdm.write(f"FIGI не найден для тикера {ticker}, пропускаем...")
-                        continue
-
-                    # Определяем самую раннюю доступную дату
-                    if first_candle_date:
-                        earliest_date = first_candle_date
-                        print(f"Используем дату первой свечи из информации об инструменте: {earliest_date}")
-                    else:
-                        print("Дата первой свечи не найдена, выполняем поиск...")
-                        earliest_date = find_earliest_available_date(client, figi, ticker)
-                        if not earliest_date:
-                            tqdm.write(f"Не удалось определить начальную дату для {ticker}, пропускаем...")
-                            continue
-                        print(f"Найдена самая ранняя доступная дата: {earliest_date}")
-
-                    tqdm.write(f"Тикер {ticker}: загрузка данных с {earliest_date}")
-
-                    # Создаем таблицу в БД
-                    create_table(conn, ticker)
-
-                    # Получаем все свечи (с оптимизацией: передаём conn для проверки последней даты)
-                    candles = get_candles(client, figi, earliest_date, ticker, conn)
-
-                    # Сохраняем в БД
-                    save_to_db(conn, ticker, candles)
-
-                    tqdm.write(f"Тикер {ticker}: сохранено {len(candles)} записей")
-
-                except Exception as e:
-                    tqdm.write(f"Ошибка при обработке тикера {ticker}: {str(e)}")
-                    continue
-
+        with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
+            # Лист 1: Сводка
+            summary_data = {
+                'Метрика': [
+                    'Стартовый капитал (сумм)',
+                    'Финальный капитал',
+                    'Общая прибыль (RUB)',
+                    'Общая доходность (%)',
+                    'Всего сделок',
+                    'Win Rate (%)',
+                    'Период теста (с)'
+                ],
+                'Значение': [
+                    f"{total_start_capital:,.2f}",
+                    f"{total_final_capital:,.2f}",
+                    f"{total_profit:,.2f}",
+                    f"{total_return_pct:.2f}",
+                    len(all_trades),
+                    f"{win_rate:.2f}",
+                    effective_start_date.strftime('%Y-%m-%d')
+                ]
+            }
+            pd.DataFrame(summary_data).to_excel(writer, sheet_name='Сводка', index=False)
+            
+            # Лист 2: По акциям
+            if not df_report.empty:
+                df_report.to_excel(writer, sheet_name='По акциям', index=False)
+            
+            # Лист 3: Все сделки
+            if all_trades:
+                df_trades = pd.DataFrame(all_trades)
+                # Форматирование
+                df_trades['date'] = df_trades['date'].dt.strftime('%Y-%m-%d')
+                df_trades['profit'] = df_trades['profit'].apply(lambda x: f"{x:.2f}")
+                df_trades['price'] = df_trades['price'].apply(lambda x: f"{x:.2f}")
+                df_trades['commission'] = df_trades['commission'].apply(lambda x: f"{x:.2f}")
+                df_trades['capital_after'] = df_trades['capital_after'].apply(lambda x: f"{x:.2f}")
+                
+                df_trades.to_excel(writer, sheet_name='Все сделки', index=False)
+        
+        print(f"\n💾 Отчет сохранен в файл: {output_filename}")
+        
     except Exception as e:
-        print(f"Ошибка подключения к API Тинькофф: {e}")
-
-    # Закрываем соединение с БД
-    print("Закрытие соединения с PostgreSQL")
-    conn.close()
-    print("Готово!")
-
-    # Время выполнения
-    exec_time = time.time() - start_time
-    print(f"\n Все задачи выполнены за {exec_time:.2f} секунд")
+        print(f"\n❌ Ошибка при сохранении Excel: {e}")
+        print("Попробуйте установить библиотеку openpyxl: pip install openpyxl")
 
 if __name__ == "__main__":
     main()

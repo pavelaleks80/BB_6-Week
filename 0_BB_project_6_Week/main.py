@@ -94,7 +94,7 @@ def main():
         # Если это signals_processor — ждём готовности данных
         if script_name == "signals_processor.py":
             wait_start = time.time()
-            timeout = 600  # 10 минут
+            timeout = 600  # 10 минут / Данный параметр можно изменять
             while not data_is_ready():
                 elapsed = time.time() - wait_start
                 if elapsed > timeout:
