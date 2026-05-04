@@ -11,12 +11,13 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import create_engine, text, inspect
 import os
-# УДАЛЕНО: import t_tech.invest as invest (будет конфликт имен)
 from dotenv import load_dotenv
 
-# Импортируем только необходимые классы напрямую
-from t_tech.invest import AsyncClient, InstrumentsService, CandlesService, CandleInterval, GetCandlesRequest
-# УДАЛЕНО: from t_tech.invest.protos.v1 import instruments_pb2 (не используется в коде)
+# Исправленный импорт для t_tech.invest
+import t_tech.invest as invest
+from t_tech.invest import AsyncClient, CandleInterval, GetCandlesRequest
+# Сервисы обычно не импортируются напрямую, а создаются клиентом
+# Если это не сработает, попробуем другой вариант импорта
 
 load_dotenv()
 
@@ -37,19 +38,23 @@ def get_ticker_figi_sync(ticker: str) -> str | None:
     """
     async def _get():
         async with AsyncClient(token=config.TOKEN) as client:
-            service = InstrumentsService(client)
-            # Ищем инструмент по тикуру
+            # В новом SDK сервисы часто доступны как атрибуты клиента
+            # Пробуем получить сервис инструментов
+            try:
+                # Вариант 1: Сервис как атрибут клиента
+                service = client.instruments 
+                # Или client.get_instruments_service() если есть такой метод
+            except AttributeError:
+                # Вариант 2: Прямой импорт сервиса, если он доступен
+                from t_tech.invest.services import InstrumentsService
+                service = InstrumentsService(client)
+            
             response = await service.find_instrument(query=ticker)
             if response.instruments:
-                # Берем первый подходящий инструмент
                 return response.instruments[0].figi
             return None
     
-    try:
-        return asyncio.run(_get())
-    except Exception as e:
-        print(f"❌ Ошибка поиска FIGI для {ticker}: {e}")
-        return None
+    return asyncio.run(_get())
 
 async def load_candles_for_ticker(ticker: str, figi: str, start_date: datetime):
     """
@@ -60,13 +65,18 @@ async def load_candles_for_ticker(ticker: str, figi: str, start_date: datetime):
     all_candles = []
     
     async with AsyncClient(token=config.TOKEN) as client:
-        service = CandlesService(client)
+        # Получаем сервис свечей
+        try:
+            service = client.candles
+        except AttributeError:
+            from t_tech.invest.services import CandlesService
+            service = CandlesService(client)
         
+        # Разбиваем период на куски по 365 дней (лимит API)
         current_start = start_date
         end_date = datetime.now(timezone.utc)
         
         while current_start < end_date:
-            # Разбиваем на периоды по 400 дней (с запасом, но безопасно)
             req_end = min(current_start + timedelta(days=400), end_date)
             
             try:
@@ -79,7 +89,7 @@ async def load_candles_for_ticker(ticker: str, figi: str, start_date: datetime):
                 
                 if response.candles:
                     for candle in response.candles:
-                        # Безопасное извлечение времени
+                        # Обработка времени с учетом таймзоны
                         candle_time = candle.time
                         if candle_time.tzinfo is not None:
                             candle_time = candle_time.replace(tzinfo=None)
@@ -94,43 +104,36 @@ async def load_candles_for_ticker(ticker: str, figi: str, start_date: datetime):
                         })
                     print(f"   Получено {len(response.candles)} свечей за период {current_start.date()} - {req_end.date()}")
                 else:
-                    # Если свечей нет, все равно двигаем окно, чтобы не зациклиться
-                    pass 
+                    print(f"   Нет данных за период {current_start.date()} - {req_end.date()}")
                     
             except Exception as e:
                 print(f"   ❌ Ошибка при запросе периода {current_start}: {e}")
             
             current_start = req_end
-            await asyncio.sleep(0.3) # Небольшая задержка
+            await asyncio.sleep(0.5)
 
     if not all_candles:
-        print(f"⚠️ Данные для {ticker} не найдены за весь период.")
+        print(f"⚠️ Данные для {ticker} не найдены.")
         return
 
-    # Создаем DataFrame
     df = pd.DataFrame(all_candles)
     
-    # Проверка на пустоту после создания (на всякий случай)
+    # Проверка на пустой DataFrame
     if df.empty:
-        print(f"⚠️ DataFrame пуст для {ticker}.")
+        print(f"⚠️ Пустой DataFrame для {ticker}. Пропускаем.")
         return
-
+        
     df = df.sort_values('date').drop_duplicates(subset=['date'], keep='last')
     df.set_index('date', inplace=True)
 
     # === РАСЧЕТ ИНДИКАТОРОВ ===
-    # Используем ddof=0 для совпадения с биржевыми терминалами
     df['sma'] = df['close'].rolling(window=WINDOW).mean()
     std = df['close'].rolling(window=WINDOW).std(ddof=0)
-    
     df['upper_band'] = df['sma'] + (NUM_STD * std)
     df['lower_band'] = df['sma'] - (NUM_STD * std)
     
-    # Округляем
     cols_to_round = ['open', 'high', 'low', 'close', 'sma', 'upper_band', 'lower_band']
-    # Округляем только существующие колонки (если вдруг расчет не прошел)
-    existing_cols = [c for c in cols_to_round if c in df.columns]
-    df[existing_cols] = df[existing_cols].round(5)
+    df[cols_to_round] = df[cols_to_round].round(5)
 
     # === СОХРАНЕНИЕ В БД ===
     table_name = f"quotes_{ticker.lower()}"
@@ -155,26 +158,22 @@ async def load_candles_for_ticker(ticker: str, figi: str, start_date: datetime):
                 conn.commit()
                 print(f"   🗄️ Таблица {table_name} создана.")
             
-            # Удаляем старые данные за период загрузки, чтобы избежать дублей
             min_date = df.index.min()
             delete_sql = f"DELETE FROM {table_name} WHERE date >= :start_date"
             conn.execute(text(delete_sql), {"start_date": min_date})
             
-            # Загружаем новые данные
             df.to_sql(table_name, con=conn, if_exists='append', index=True, index_label='date')
             conn.commit()
             
         print(f"   ✅ Загружено и сохранено {len(df)} записей в {table_name}.")
-    except Exception as db_err:
-        print(f"   ❌ Ошибка записи в БД для {ticker}: {db_err}")
+    except Exception as e:
+        print(f"   ❌ Ошибка сохранения в БД для {ticker}: {e}")
 
 def run_loader():
     """Точка входа для запуска загрузчика."""
     print("🚀 Запуск data_loader.py...")
     
-    # Дата начала: 10 лет назад
     start_date = datetime.now(timezone.utc) - timedelta(days=365*10)
-    
     tickers_to_load = config.TICKERS
     
     success_count = 0
