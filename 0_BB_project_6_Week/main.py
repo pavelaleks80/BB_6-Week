@@ -50,21 +50,36 @@ def clear_log():
 # Проверяет наличие обновлённых данных в БД
 def data_is_ready():
     """
-    Проверяет, есть ли данные за предыдущую неделю хотя бы по одному тикеру
+    Проверяет, есть ли данные за последнюю доступную неделю в БД.
+    Сравнивает максимальную дату в таблице с текущей датой.
+    Если разница <= 14 дней, считаем данные актуальными.
     """
     try:
-
         conn = psycopg2.connect(**DB_CONFIG)
         cur = conn.cursor()
+        
+        # Находим максимальную дату в таблице quotes_gazp (как пример тикера)
         cur.execute("""
-            SELECT EXISTS (
-                SELECT 1 FROM quotes_gazp 
-                WHERE date = CURRENT_DATE - INTERVAL '10 days'
-            )
+            SELECT MAX(date) FROM quotes_gazp
         """)
-        is_ready = cur.fetchone()[0]
+        max_date_result = cur.fetchone()[0]
         conn.close()
+        
+        if max_date_result is None:
+            return False
+            
+        # Проверяем, что последняя дата в БД не старше 14 дней от сегодня
+        # (учитываем выходные и возможные задержки данных)
+        days_diff = (datetime.now().date() - max_date_result).days
+        is_ready = 0 <= days_diff <= 14
+        
+        if is_ready:
+            print(f"[OK] Данные актуальны. Последняя дата в БД: {max_date_result}")
+        else:
+            print(f"[WAIT] Данные устарели или слишком ранние. Последняя дата: {max_date_result}, разница: {days_diff} дн.")
+            
         return is_ready
+        
     except Exception as e:
         print(f"[ERROR] Не удалось проверить данные в БД: {e}")
         return False
@@ -84,7 +99,7 @@ def main():
         ("data_loader.py", 0),  # ждём 10 секунд после загрузки
         ("signals_processor.py", 0),  # ждём 5 секунд после signals_processor
         ("telegram_notifier.py", 0),  # выполняем без задержки
-        ("email_notifier.py", 0)  # отправляем email-отчёт (ДОБАВЛЕНО)
+        ("email_notifier.py", 0)  # отправляем email-отчёт
     ]
 
 #=== Изменение от 090725 ============================
@@ -102,7 +117,7 @@ def main():
                     tqdm.write("Таймаут ожидания данных для signals_processor")
                     break
                 tqdm.write("Ожидание загрузки данных...")
-                time.sleep(60) # интервал проверки1 минута
+                time.sleep(60) # интервал проверки 1 минута
 
     # Запуск скрипта
         success, output = run_script(script_name)

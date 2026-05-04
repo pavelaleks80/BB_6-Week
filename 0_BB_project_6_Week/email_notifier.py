@@ -193,7 +193,10 @@ def main():
     signals = get_unsent_signals()
     
     if not signals:
-        logger.info("Нет новых сигналов для отправки. Завершение работы.")
+        # Даже если сигналов нет, отправляем уведомление как в Telegram
+        logger.info("Нет новых сигналов для отправки. Отправляем уведомление об этом.")
+        message_text = "ℹ️ Нет новых торговых сигналов.\nДанные проверены, сигналы отсутствуют."
+        send_email_notification(message_text)
         return
 
     logger.info(f"[+] Найдено {len(signals)} новых сигналов. Формирование сообщения...")

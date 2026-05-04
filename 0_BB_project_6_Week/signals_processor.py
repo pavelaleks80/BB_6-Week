@@ -16,14 +16,15 @@ from tqdm import tqdm  # Импортируем tqdm для прогресс-б�
 from config import DB_CONFIG, TICKERS, EMAIL_CONFIG
 from telegram_bot import send_telegram_message
 import time
-from email_notifier import send_email_notification  # <--- ДОБАВИТЬ ЭТУ СТРОКУ
+# from email_notifier import send_email_notification  # УДАЛЕНО: email отправляется только через email_notifier.py
 
 N = 5  # Количество недель истории (влево) для проверки наличия сигнала ВНИМАНИЕ
 
 # Задержка в отправке сообщений
 def send_with_delay(message, is_summary=False):
     """
-    Отправляет сообщение в Telegram и Email.
+    Отправляет сообщение ТОЛЬКО в Telegram.
+    Email отправляется отдельно через email_notifier.py (резервный канал).
     
     Args:
         message: текст сообщения
@@ -37,16 +38,8 @@ def send_with_delay(message, is_summary=False):
         print(f" Ошибка при отправке сообщения в Telegram: {e}")
         time.sleep(5)  # Увеличиваем задержку при ошибке
         
-    # 2. Отправка на Email (только для индивидуальных сигналов, не для summary)
-    try:
-        if EMAIL_CONFIG['enabled'] and not is_summary:
-            # Очищаем сообщение от звездочек (*) для красивого вида в письме
-            clean_message = message.replace('*', '')
-            send_email_notification(clean_message)  # Исправлено: передаём только текст сообщения
-            time.sleep(2)  # Пауза между сервисами
-    except Exception as e:
-        print(f" Ошибка Email: {e}")
-        time.sleep(5) # Общая задержка цикла
+    # 2. Email удалён отсюда - отправляется только через email_notifier.py
+    # Это предотвращает дублирование писем
 
 # Добавлено 17.07.25 Сообщение о начала анализа сигналов
 msg = "* ПЕСОЧНИЦА Начинаем анализ сигналов*"
