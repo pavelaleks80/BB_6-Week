@@ -1,378 +1,197 @@
 """
 data_loader.py
-
-Назначение: Загружает данные по акциям из Tinkoff Invest API,
-сохраняет их в PostgreSQL с расчётом Полос Боллинджера.
-
-Используется:
-- Tinkoff Invest API
-- PostgreSQL
+Загружает исторические данные (свечи) через T-Invest API (новый SDK t-tech-investments)
+и сохраняет их в PostgreSQL.
+Также рассчитывает индикаторы (SMA, Bollinger Bands) для сохранения в БД.
 """
-import sys
-import time
-import os
+
+import asyncio
 import pandas as pd
 import numpy as np
-from tqdm import tqdm
-from datetime import datetime, timedelta
-import psycopg2
-from psycopg2 import sql
-from tinkoff.invest import Client, CandleInterval
-from tinkoff.invest.utils import now
-from tinkoff.invest.exceptions import RequestError
-from psycopg2.extras import execute_batch
-from config import DB_CONFIG, TOKEN, TICKERS
+from datetime import datetime, timedelta, timezone
+from sqlalchemy import create_engine, text, inspect
+import os
+# УДАЛЕНО: import t_tech.invest as invest (будет конфликт имен)
+from dotenv import load_dotenv
 
-def connect():
-    """Подключение к базе данных PostgreSQL"""
-    return psycopg2.connect(**DB_CONFIG)
+# Импортируем только необходимые классы напрямую
+from t_tech.invest import AsyncClient, InstrumentsService, CandlesService, CandleInterval, GetCandlesRequest
+# УДАЛЕНО: from t_tech.invest.protos.v1 import instruments_pb2 (не используется в коде)
 
-def get_figi_for_ticker(client, ticker):
+load_dotenv()
+
+# Импорт конфигурации
+import config
+
+# Настройки БД
+DB_URI = config.DATABASE_URI
+engine = create_engine(DB_URI)
+
+# Настройки индикаторов
+WINDOW = config.BOLLINGER_CONFIG['window']
+NUM_STD = config.BOLLINGER_CONFIG['num_std']
+
+def get_ticker_figi_sync(ticker: str) -> str | None:
+    """
+    Синхронная обертка для получения FIGI по тикуру.
+    """
+    async def _get():
+        async with AsyncClient(token=config.TOKEN) as client:
+            service = InstrumentsService(client)
+            # Ищем инструмент по тикуру
+            response = await service.find_instrument(query=ticker)
+            if response.instruments:
+                # Берем первый подходящий инструмент
+                return response.instruments[0].figi
+            return None
     
-    """
-Получает FIGI и дату первой свечи для заданного тикера.
-
-Args:
-    client: клиент Tinkoff Invest API
-    ticker: тикер акции
-
-Returns:
-    figi: уникальный идентификатор инструмента
-    first_candle_date: дата первой доступной свечи
-"""
     try:
-        instruments = client.instruments.shares().instruments
-        for instrument in instruments:
-            if instrument.ticker == ticker:
-                print(f"Для тикера {ticker} найдена дата первой свечи: {instrument.first_1day_candle_date}")
-                return instrument.figi, instrument.first_1day_candle_date
-        print(f"Для тикера {ticker} не найдена информация о первой свече")
-        return None, None
-    except RequestError as e:
-        print(f"Ошибка при получении FIGI для {ticker}: {e}")
-        return None, None
-
-
-def find_earliest_available_date(client, figi, ticker):
-    """
-    Ищет самую раннюю доступную дату для получения данных по тикеру.
-
-    Args:
-        client: клиент Tinkoff Invest API
-        figi: идентификатор инструмента
-        ticker: тикер акции
-
-    Returns:
-        date: самая ранняя доступная дата
-    """
-    end_date = now()
-    start_date = datetime(1900, 1, 1)
-    print(f"Поиск самой ранней доступной даты для FIGI {figi} (тикер: {ticker})")
-
-    try:
-        candles = client.market_data.get_candles(
-            figi=figi,
-            from_=start_date,
-            to=start_date + timedelta(days=7),
-            interval=CandleInterval.CANDLE_INTERVAL_WEEK
-        )
-        if candles.candles:
-            print(f"Найдены данные с самой ранней даты {start_date}")
-            return start_date
-    except RequestError:
-        pass
-
-    last_successful_date = None
-    while start_date < end_date:
-        mid_date = start_date + (end_date - start_date) // 2
-        try:
-            candles = client.market_data.get_candles(
-                figi=figi,
-                from_=mid_date,
-                to=mid_date + timedelta(days=7),
-                interval=CandleInterval.CANDLE_INTERVAL_WEEK
-            )
-            if candles.candles:
-                print(f"Найдены данные для даты {mid_date}")
-                last_successful_date = mid_date
-                end_date = mid_date - timedelta(days=7)
-            else:
-                start_date = mid_date + timedelta(days=7)
-        except RequestError:
-            start_date = mid_date + timedelta(days=7)
-
-    if last_successful_date:
-        print(f"Самая ранняя доступная дата: {last_successful_date}")
-    else:
-        print("Не удалось найти доступные данные")
-    return last_successful_date
-
-def get_last_candle_date_from_db(conn, ticker):
-    """
-    Получает дату последней свечи из БД для тикера.
-    Возвращает datetime или None, если таблица пуста/не существует.
-    """
-    table_name = f"quotes_{ticker.lower()}"
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(sql.SQL("SELECT MAX(date) FROM {}").format(sql.Identifier(table_name)))
-            result = cursor.fetchone()[0]
-            if result:
-                print(f"Для тикера {ticker} последняя дата в БД: {result}")
-                return result
-            else:
-                print(f"Таблица {table_name} пуста")
-                return None
+        return asyncio.run(_get())
     except Exception as e:
-        print(f"Таблица {table_name} не существует или ошибка: {e}")
+        print(f"❌ Ошибка поиска FIGI для {ticker}: {e}")
         return None
 
-
-def get_candles(client, figi, from_date, ticker, conn=None):
+async def load_candles_for_ticker(ticker: str, figi: str, start_date: datetime):
     """
-    Загружает исторические данные по свечам за указанный период.
-
-    OPTIMIZATION: Если передано соединение с БД (conn), проверяет последнюю дату
-    и загружает только недостающие данные.
+    Загружает свечи для одного тикера и сохраняет в БД.
     """
+    print(f"📥 Загрузка данных для {ticker} (FIGI: {figi})...")
+    
     all_candles = []
+    
+    async with AsyncClient(token=config.TOKEN) as client:
+        service = CandlesService(client)
+        
+        current_start = start_date
+        end_date = datetime.now(timezone.utc)
+        
+        while current_start < end_date:
+            # Разбиваем на периоды по 400 дней (с запасом, но безопасно)
+            req_end = min(current_start + timedelta(days=400), end_date)
+            
+            try:
+                response = await service.get_candles(GetCandlesRequest(
+                    figi=figi,
+                    from_=current_start,
+                    to=req_end,
+                    interval=CandleInterval.CANDLE_INTERVAL_WEEK
+                ))
+                
+                if response.candles:
+                    for candle in response.candles:
+                        # Безопасное извлечение времени
+                        candle_time = candle.time
+                        if candle_time.tzinfo is not None:
+                            candle_time = candle_time.replace(tzinfo=None)
+                        
+                        all_candles.append({
+                            'date': candle_time,
+                            'open': float(candle.open.units) + float(candle.open.nano) / 1e9,
+                            'high': float(candle.high.units) + float(candle.high.nano) / 1e9,
+                            'low': float(candle.low.units) + float(candle.low.nano) / 1e9,
+                            'close': float(candle.close.units) + float(candle.close.nano) / 1e9,
+                            'volume': int(candle.volume)
+                        })
+                    print(f"   Получено {len(response.candles)} свечей за период {current_start.date()} - {req_end.date()}")
+                else:
+                    # Если свечей нет, все равно двигаем окно, чтобы не зациклиться
+                    pass 
+                    
+            except Exception as e:
+                print(f"   ❌ Ошибка при запросе периода {current_start}: {e}")
+            
+            current_start = req_end
+            await asyncio.sleep(0.3) # Небольшая задержка
 
-    # === OPTIMIZATION: Проверяем последнюю дату в БД ===
-    if conn:
-        last_db_date = get_last_candle_date_from_db(conn, ticker)
-        if last_db_date:
-            # Загружаем только данные ПОСЛЕ последней даты в БД
-            current_date = last_db_date + timedelta(days=1)
-            print(f"OPTIMIZATION: Загружаем данные для {ticker} с {current_date} (после последней записи в БД)")
+    if not all_candles:
+        print(f"⚠️ Данные для {ticker} не найдены за весь период.")
+        return
+
+    # Создаем DataFrame
+    df = pd.DataFrame(all_candles)
+    
+    # Проверка на пустоту после создания (на всякий случай)
+    if df.empty:
+        print(f"⚠️ DataFrame пуст для {ticker}.")
+        return
+
+    df = df.sort_values('date').drop_duplicates(subset=['date'], keep='last')
+    df.set_index('date', inplace=True)
+
+    # === РАСЧЕТ ИНДИКАТОРОВ ===
+    # Используем ddof=0 для совпадения с биржевыми терминалами
+    df['sma'] = df['close'].rolling(window=WINDOW).mean()
+    std = df['close'].rolling(window=WINDOW).std(ddof=0)
+    
+    df['upper_band'] = df['sma'] + (NUM_STD * std)
+    df['lower_band'] = df['sma'] - (NUM_STD * std)
+    
+    # Округляем
+    cols_to_round = ['open', 'high', 'low', 'close', 'sma', 'upper_band', 'lower_band']
+    # Округляем только существующие колонки (если вдруг расчет не прошел)
+    existing_cols = [c for c in cols_to_round if c in df.columns]
+    df[existing_cols] = df[existing_cols].round(5)
+
+    # === СОХРАНЕНИЕ В БД ===
+    table_name = f"quotes_{ticker.lower()}"
+    
+    try:
+        with engine.connect() as conn:
+            if not inspect(engine).has_table(table_name):
+                create_table_sql = f"""
+                CREATE TABLE {table_name} (
+                    date TIMESTAMP PRIMARY KEY,
+                    open NUMERIC,
+                    high NUMERIC,
+                    low NUMERIC,
+                    close NUMERIC,
+                    volume BIGINT,
+                    sma NUMERIC,
+                    upper_band NUMERIC,
+                    lower_band NUMERIC
+                )
+                """
+                conn.execute(text(create_table_sql))
+                conn.commit()
+                print(f"   🗄️ Таблица {table_name} создана.")
+            
+            # Удаляем старые данные за период загрузки, чтобы избежать дублей
+            min_date = df.index.min()
+            delete_sql = f"DELETE FROM {table_name} WHERE date >= :start_date"
+            conn.execute(text(delete_sql), {"start_date": min_date})
+            
+            # Загружаем новые данные
+            df.to_sql(table_name, con=conn, if_exists='append', index=True, index_label='date')
+            conn.commit()
+            
+        print(f"   ✅ Загружено и сохранено {len(df)} записей в {table_name}.")
+    except Exception as db_err:
+        print(f"   ❌ Ошибка записи в БД для {ticker}: {db_err}")
+
+def run_loader():
+    """Точка входа для запуска загрузчика."""
+    print("🚀 Запуск data_loader.py...")
+    
+    # Дата начала: 10 лет назад
+    start_date = datetime.now(timezone.utc) - timedelta(days=365*10)
+    
+    tickers_to_load = config.TICKERS
+    
+    success_count = 0
+    for ticker in tickers_to_load:
+        print(f"\n--- Обработка {ticker} ---")
+        figi = get_ticker_figi_sync(ticker)
+        
+        if figi:
+            try:
+                asyncio.run(load_candles_for_ticker(ticker, figi, start_date))
+                success_count += 1
+            except Exception as e:
+                print(f"❌ Критическая ошибка при загрузке {ticker}: {e}")
         else:
-            current_date = from_date
-            print(f"БД пуста/не существует, загружаем все данные с {from_date}")
-    else:
-        current_date = from_date
+            print(f"⚠️ Не найден FIGI для тикера {ticker}. Пропускаем.")
 
-    end_date = now()
-    chunk_size = timedelta(days=730)  # Увеличено с 365 до 730 дней
-
-    while current_date < end_date:
-        try:
-            next_date = min(current_date + chunk_size, end_date)
-            candles = client.market_data.get_candles(
-                figi=figi,
-                from_=current_date,
-                to=next_date,
-                interval=CandleInterval.CANDLE_INTERVAL_WEEK
-            )
-            if candles.candles:
-                all_candles.extend(candles.candles)
-            current_date = next_date
-        except RequestError as e:
-            print(f"Ошибка при получении свечей: {e}")
-            break
-
-    print(f"Всего загружено {len(all_candles)} записей для {ticker}")
-    return all_candles
-
-
-def calculate_bollinger_bands(df, window=20, num_std=2):
-    """
-    Рассчитывает значения Полос Боллинджера.
-
-    Args:
-        df: DataFrame с данными по ценам
-        window: окно скользящего среднего (в неделях)
-        num_std: количество стандартных отклонений
-
-    Returns:
-        df: DataFrame с добавленными колонками sma, upper_band, lower_band
-    """
-    df['sma'] = df['close'].rolling(window=window).mean()
-    df['std'] = df['close'].rolling(window=window).std()
-    df['upper_band'] = df['sma'] + (num_std * df['std'])
-    df['lower_band'] = df['sma'] - (num_std * df['std'])
-    return df
-
-
-def create_table(conn, ticker):
-    """
-    Создаёт таблицу в PostgreSQL для хранения данных по конкретному тикеру.
-
-    Args:
-        conn: соединение с базой данных
-        ticker: тикер акции
-    """
-    table_name = f"quotes_{ticker.lower()}"
-    print(f"Создание таблицы {table_name} для тикера {ticker}")
-
-    query = sql.SQL("""
-        CREATE TABLE IF NOT EXISTS {} (
-            date TIMESTAMP PRIMARY KEY,
-            open NUMERIC,
-            high NUMERIC,
-            low NUMERIC,
-            close NUMERIC,
-            volume BIGINT,
-            sma NUMERIC,
-            upper_band NUMERIC,
-            lower_band NUMERIC
-        )
-    """).format(sql.Identifier(table_name))
-
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(query)
-        conn.commit()
-        print(f"Таблица {table_name} успешно создана")
-    except Exception as e:
-        print(f"Ошибка при создании таблицы: {e}")
-
-
-def save_to_db(conn, ticker, candles):
-    """
-    Сохраняет данные о свечах в PostgreSQL после расчёта индикаторов,
-    предварительно проверяя, какие даты уже существуют.
-    """
-    if not candles:
-        print(f"Нет данных для сохранения для тикера {ticker}")
-        return
-
-    table_name = f"quotes_{ticker.lower()}"
-    
-    # Получаем список дат, уже существующих в БД
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(sql.SQL("SELECT date FROM {}").format(sql.Identifier(table_name)))
-            existing_dates = set(row[0] for row in cursor.fetchall())
-    except Exception as e:
-        print(f"Ошибка при чтении существующих дат: {e}")
-        existing_dates = set()
-
-    # Преобразование в DataFrame
-    data = []
-    for candle in candles:
-        if candle.time in existing_dates:
-            continue  # Пропускаем, если такая дата уже есть
-        data.append({
-            'date': candle.time,
-            'open': float(candle.open.units + candle.open.nano / 1e9),
-            'high': float(candle.high.units + candle.high.nano / 1e9),  # Исправлено: было candle.open.nano
-            'low': float(candle.low.units + candle.low.nano / 1e9),
-            'close': float(candle.close.units + candle.close.nano / 1e9),
-            'volume': int(candle.volume)
-        })
-
-    if not data:
-        print(f"Нет новых данных для тикера {ticker}, все записи уже в БД")
-        return
-
-    df = pd.DataFrame(data)
-    df = calculate_bollinger_bands(df)
-    if 'std' in df.columns:
-        df.drop(columns=['std'], inplace=True)
-    df.dropna(inplace=True)
-
-    # Подготовка данных для вставки
-    records = df.to_records(index=False)
-    data_to_insert = [
-        tuple(
-            None if pd.isna(x) else (
-                int(x) if isinstance(x, np.integer) else
-                float(x) if isinstance(x, np.floating) else x
-            )
-            for x in row
-        )
-        for row in records
-    ]
-
-    print(f"Сохранение {len(data_to_insert)} новых записей в таблицу {table_name}")
-    try:
-        with conn.cursor() as cursor:
-            insert_query = sql.SQL("""
-                INSERT INTO {}
-                (date, open, high, low, close, volume, sma, upper_band, lower_band)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (date) DO NOTHING
-            """).format(sql.Identifier(table_name))
-            execute_batch(cursor, insert_query, data_to_insert, page_size=500)
-        conn.commit()
-        print(f"Новые данные для {ticker} успешно сохранены")
-    except Exception as e:
-        print(f"Ошибка при сохранении данных: {e}")
-
-def main():
-    """
-    Основная функция запуска процесса загрузки данных.
-    """    
-    start_time = time.time()
-    
-    # Проверка токена
-    if not TOKEN or TOKEN == 'TOKEN':
-        print("ОШИБКА: Необходимо указать токен API Тинькофф Инвестиций!")
-        return
-
-    # Подключение к PostgreSQL
-    try:
-        print("Подключение к PostgreSQL...")
-        conn = psycopg2.connect(**DB_CONFIG)
-        print("Успешное подключение к PostgreSQL")
-    except Exception as e:
-        print(f"Ошибка подключения к PostgreSQL: {e}")
-        return
-
-    # Подключение к API Тинькофф
-    try:
-        print("Подключение к API Тинькофф Инвестиций...")
-        with Client(TOKEN) as client:
-            print("Успешное подключение к API Тинькофф")
-            for ticker in tqdm(TICKERS, desc="Обработка тикеров"):
-                try:
-                    print(f"\nНачинаем обработку тикера {ticker}")
-
-                    # Получаем FIGI и дату первой свечи для тикера
-                    figi, first_candle_date = get_figi_for_ticker(client, ticker)
-                    if not figi:
-                        tqdm.write(f"FIGI не найден для тикера {ticker}, пропускаем...")
-                        continue
-
-                    # Определяем самую раннюю доступную дату
-                    if first_candle_date:
-                        earliest_date = first_candle_date
-                        print(f"Используем дату первой свечи из информации об инструменте: {earliest_date}")
-                    else:
-                        print("Дата первой свечи не найдена, выполняем поиск...")
-                        earliest_date = find_earliest_available_date(client, figi, ticker)
-                        if not earliest_date:
-                            tqdm.write(f"Не удалось определить начальную дату для {ticker}, пропускаем...")
-                            continue
-                        print(f"Найдена самая ранняя доступная дата: {earliest_date}")
-
-                    tqdm.write(f"Тикер {ticker}: загрузка данных с {earliest_date}")
-
-                    # Создаем таблицу в БД
-                    create_table(conn, ticker)
-
-                    # Получаем все свечи
-                    candles = get_candles(client, figi, earliest_date, ticker, conn)
-
-                    # Сохраняем в БД
-                    save_to_db(conn, ticker, candles)
-
-                    tqdm.write(f"Тикер {ticker}: сохранено {len(candles)} записей")
-
-                except Exception as e:
-                    tqdm.write(f"Ошибка при обработке тикера {ticker}: {str(e)}")
-                    continue
-
-    except Exception as e:
-        print(f"Ошибка подключения к API Тинькофф: {e}")
-
-    # Закрываем соединение с БД
-    print("Закрытие соединения с PostgreSQL")
-    conn.close()
-    print("Готово!")
-
-    # Время выполнения
-    exec_time = time.time() - start_time
-    print(f"\n Все задачи выполнены за {exec_time:.2f} секунд")
+    print(f"\n🏁 Загрузка завершена. Успешно обработано тикеров: {success_count}/{len(tickers_to_load)}")
 
 if __name__ == "__main__":
-    main()
+    run_loader()
