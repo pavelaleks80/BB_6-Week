@@ -1,0 +1,11 @@
+
+# Core dependencies
+t-tech-investments --index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
+pandas
+numpy
+sqlalchemy
+psycopg2-binary # или asyncpg для асинхронной работы с PostgreSQL
+python-dotenv
+aiogram # Для Telegram бота
+# Добавьте другие зависимости, если они требуются для email (например, smtplib встроен, но можно использовать aiosmtplib для асинхронности)
+
